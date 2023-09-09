@@ -49,7 +49,7 @@ class Hyperparameter(object):
         raise NotImplementedError
 
     @abstractmethod
-    def suggest_parameter(self, optuna_suggest: optuna.Trial):
+    def suggest_parameter(self, optuna_suggest: optuna.integration.TorchDistributedTrial):
         raise NotImplementedError
 
     @abstractmethod
@@ -389,7 +389,7 @@ def parse_dict(input_hyperparameters: Dict[str, str], hyperparameter_template_ma
 
 
 def generate_hyperparameters(
-        optuna_suggest: optuna.Trial,
+        optuna_suggest: optuna.integration.TorchDistributedTrial,
         task_options: TaskOptions
 ) -> Tuple[Dict, Dict]:
     """

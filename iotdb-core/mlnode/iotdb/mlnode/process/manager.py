@@ -32,6 +32,49 @@ from iotdb.mlnode.process.task import (ForecastAutoTuningTrainingTask,
                                        ForecastFixedParamTrainingTask,
                                        ForecastingInferenceTask,
                                        _BasicTrainingTask)
+from multiprocessing.pool import Pool
+
+
+class NoDaemonProcess(mp.Process):
+    @property
+    def daemon(self):
+        return False
+
+    @daemon.setter
+    def daemon(self, value):
+        pass
+
+
+class NoDaemonContext(type(mp.get_context())):
+    Process = NoDaemonProcess
+
+
+# We sub-class multiprocessing.pool.Pool instead of multiprocessing.Pool
+# because the latter is only a wrapper function, not a proper class.
+class NestablePool(Pool):
+    def __init__(self, *args, **kwargs):
+        kwargs['context'] = NoDaemonContext()
+        super(NestablePool, self).__init__(*args, **kwargs)
+        self.processes = []
+
+    def apply_async(self,
+                    func,
+                    args=(),
+                    kwds=None,
+                    callback=None,
+                    error_callback=None
+        ):
+        if kwds is None:
+            kwds = {}
+        p = mp.Process(target=func, args=args, kwargs=kwds)
+        self.processes.append(p)
+        super(NestablePool, self).apply_async(func, args=args, kwds=kwds, callback=callback,
+                                              error_callback=error_callback)
+        print(len(self._cache))
+    def terminate(self):
+        for p in self.processes:
+            p.terminate()
+        super(NestablePool, self).terminate()
 
 
 class TaskManager(object):
@@ -46,8 +89,8 @@ class TaskManager(object):
         """
         self.__shared_resource_manager = mp.Manager()
         self.__pid_info = self.__shared_resource_manager.dict()
-        self.__training_process_pool = mp.Pool(pool_size)
-        self.__inference_process_pool = mp.Pool(pool_size)
+        self.__training_process_pool = NestablePool(pool_size)
+        self.__inference_process_pool = NestablePool(pool_size)
 
     def create_forecast_training_task(self,
                                       model_id: str,
@@ -122,3 +165,7 @@ class TaskManager(object):
         else:
             cmds = ['kill', str(pid)]
             call(cmds)
+
+    def stop(self):
+        self.__training_process_pool.terminate()
+        self.__inference_process_pool.terminate()

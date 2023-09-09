@@ -18,6 +18,7 @@
 import os
 
 import torch
+import socket
 
 from iotdb.mlnode.constant import TSStatusCode, ModelInputName
 from iotdb.mlnode.exception import BadNodeUrlError
@@ -78,3 +79,12 @@ def pack_input_dict(batch_x: torch.Tensor,
     if batch_y_mark is not None:
         input_dict[ModelInputName.TIME_STAMP_Y.value] = batch_y_mark
     return input_dict
+
+
+def get_free_port():
+    """
+    pick up a free port
+    """
+    sock = socket.socket()
+    sock.bind(('', 0))
+    return sock.getsockname()[1]

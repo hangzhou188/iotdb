@@ -25,6 +25,8 @@ import numpy as np
 import optuna
 import pandas as pd
 import torch
+import torch.multiprocessing as mp
+import torch.distributed as dist
 
 from iotdb.mlnode.algorithm.hyperparameter import (generate_hyperparameters,
                                                    parse_fixed_hyperparameters)
@@ -38,6 +40,7 @@ from iotdb.mlnode.process.trial import ForecastingTrainingTrial
 from iotdb.mlnode.storage import model_storage
 from iotdb.mlnode.util import pack_input_dict
 from iotdb.thrift.common.ttypes import TrainingState
+from iotdb.mlnode.util import get_free_port
 
 
 class _BasicTask(object):
@@ -126,10 +129,11 @@ class ForestingTrainingObjective:
         self.model_id = model_id
 
     def __call__(self, optuna_suggest: optuna.Trial):
-        model_hyperparameters, task_hyperparameters = generate_hyperparameters(optuna_suggest,
+        optuna_suggest_distributed = optuna.integration.TorchDistributedTrial(optuna_suggest)
+        model_hyperparameters, task_hyperparameters = generate_hyperparameters(optuna_suggest_distributed,
                                                                                self.task_options)
         trial = ForecastingTrainingTrial(
-            trial_id=TRIAL_ID_PREFIX + str(optuna_suggest._trial_id),
+            trial_id=TRIAL_ID_PREFIX + str(optuna_suggest_distributed.number),
             model_id=self.model_id,
             task_options=self.task_options,
             model_hyperparameters=model_hyperparameters,
@@ -137,6 +141,45 @@ class ForestingTrainingObjective:
             dataset=self.dataset)
         loss = trial.start()
         return loss
+
+
+class ForecastDistributedOptimize:
+    def __init__(self, world_size: int, master_port: str, return_dict: dict):
+        self.world_size = world_size
+        self.master_port = master_port
+        self.return_dict = return_dict
+
+        # Set environmental variables required by torch.distributed.
+        self.device = "cpu"
+        self.backend = "gloo"
+        if torch.distributed.is_nccl_available():
+            if self.device != "cpu":
+                self.backend = "nccl"
+
+    def setup(self, rank: int):
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = self.master_port
+        dist.init_process_group(backend=self.backend, rank=rank, world_size=self.world_size)
+
+    def __call__(
+            self,
+            rank: int,
+            objective: ForestingTrainingObjective
+    ):
+        self.setup(rank)
+        if rank == 0:
+            study = optuna.create_study(direction="minimize")
+            study.optimize(objective,
+                           n_trials=descriptor.get_config().get_mn_tuning_trial_num(),
+                           n_jobs=1)
+            self.return_dict["study"] = study
+        else:
+            for _ in range(descriptor.get_config().get_mn_tuning_trial_num()):
+                try:
+                    objective(None)
+                except optuna.TrialPruned:
+                    pass
+        dist.destroy_process_group()
 
 
 class ForecastAutoTuningTrainingTask(_BasicTrainingTask):
@@ -149,7 +192,6 @@ class ForecastAutoTuningTrainingTask(_BasicTrainingTask):
             pid_info: Dict
     ):
         super().__init__(model_id, hyperparameters, pid_info)
-        self.study = optuna.create_study(direction='minimize')
         self.task_options = task_options
         self.dataset = dataset
 
@@ -157,15 +199,29 @@ class ForecastAutoTuningTrainingTask(_BasicTrainingTask):
         self.pid_info[self.model_id] = os.getpid()
         try:
             self.configNode_client.update_model_state(self.model_id, TrainingState.RUNNING)
-            self.study.optimize(ForestingTrainingObjective(
+            objective = ForestingTrainingObjective(
                 model_id=self.model_id,
                 task_options=self.task_options,
                 hyperparameters=self.hyperparameters,
                 dataset=self.dataset,
-                pid_info=self.pid_info),
-                n_trials=descriptor.get_config().get_mn_tuning_trial_num(),
-                n_jobs=descriptor.get_config().get_mn_tuning_trial_concurrency())
-            best_trial_id = TRIAL_ID_PREFIX + str(self.study.best_trial._trial_id)
+                pid_info=self.pid_info)
+            manager = mp.Manager()
+            return_dict = manager.dict()
+            # world_size = descriptor.get_config().get_mn_tuning_trial_concurrency()
+            world_size = 2
+            run_optimize = ForecastDistributedOptimize(
+                world_size=world_size,
+                master_port=str(get_free_port()),
+                return_dict=return_dict
+            )
+            mp.spawn(
+                run_optimize,
+                args=(objective,),
+                nprocs=world_size,
+                join=True
+            )
+            study = return_dict["study"]
+            best_trial_id = TRIAL_ID_PREFIX + str(study.best_trial.number)
             self.configNode_client.update_model_state(self.model_id, TrainingState.FINISHED, best_trial_id)
         except Exception as e:
             logger.warn(e)
